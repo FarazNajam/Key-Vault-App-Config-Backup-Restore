@@ -1,101 +1,145 @@
+#requires -Modules Az.Accounts, Az.AppConfiguration, Az.Storage
+
 $ErrorActionPreference = "Stop"
 
 Write-Output "=== App Configuration Restore Started ==="
 
 #------------------------------------------------------------
-# Configuration (explicit – no guessing)
+# CONFIGURATION
 #------------------------------------------------------------
-$Config = @{
-    AppConfigName  = "my-appconfig-prod"
-    ResourceGroup  = "rg-appconfig-prod"
 
+$Config = @{
+    # Storage location of backups
     StorageAccountName = "tststrgaccnthldr03"
     ContainerName      = "appconfig-backups"
 
-    # EXACT backup timestamp folder to restore from
-    BackupTimestamp = "20260209-001931"
+    # Target App Configuration
+    TargetAppConfigName = "test-aue-appconfig"
+    TargetResourceGroup = "rg-vnet-hub-spoke-prod"
 
-    # Restore mode: Full | LabelsOnly
-    RestoreMode = "Full"
+    # Restore mode: SingleLabel | AllLabelsInFolder
+    RestoreMode = "SingleLabel"
 
-    # Used only if RestoreMode = LabelsOnly
-    LabelsToRestore = @("prod", "nolabel")
+    # Backup folder path: <appconfig>/<timestamp>
+    BackupFolderPath = "test-aue-appconfig/20260208-230150"
+
+    # Used only if RestoreMode = SingleLabel
+    LabelToRestore = "prod"
 }
 
-#------------------------------------------------------------
-# Authenticate (Managed Identity)
-#------------------------------------------------------------
-Connect-AzAccount -Identity | Out-Null
-az login --identity | Out-Null
-
-Write-Output "Authenticated using Managed Identity"
+$SubscriptionId = ""
 
 #------------------------------------------------------------
-# Validate App Configuration exists
+# Authenticate
 #------------------------------------------------------------
-Get-AzAppConfigurationStore `
-    -Name $Config.AppConfigName `
-    -ResourceGroupName $Config.ResourceGroup | Out-Null
+Write-Output "Authenticating to Azure..."
+Connect-AzAccount | Out-Null
+
+if ($SubscriptionId) {
+    Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+}
+
+$context = Get-AzContext
+Write-Output "Running as: $($context.Account.Id)"
+Write-Output "Target App Configuration: $($Config.TargetAppConfigName)"
 
 #------------------------------------------------------------
 # Storage context
 #------------------------------------------------------------
-$ctx = New-AzStorageContext `
-    -StorageAccountName $Config.StorageAccountName `
-    -UseConnectedAccount
+$storageAccount = Get-AzStorageAccount `
+    -Name $Config.StorageAccountName `
+    -ResourceGroupName (Get-AzStorageAccount |
+        Where-Object { $_.StorageAccountName -eq $Config.StorageAccountName }
+        ).ResourceGroupName
 
-$tempDir = $env:TEMP
+$storageCtx = $storageAccount.Context
+
+#------------------------------------------------------------
+# Validate App Configuration exists
+#------------------------------------------------------------
+Write-Output "Validating target App Configuration..."
+
+$store = Get-AzAppConfigurationStore `
+    -Name $Config.TargetAppConfigName `
+    -ResourceGroupName $Config.TargetResourceGroup `
+    -ErrorAction Stop
+
+$endpoint = $store.Endpoint
 
 #------------------------------------------------------------
 # Locate backup blobs
 #------------------------------------------------------------
-Write-Output "Locating backup files..."
+Write-Output "Locating backup blobs..."
 
 $blobs = Get-AzStorageBlob `
+    -Context $storageCtx `
     -Container $Config.ContainerName `
-    -Context $ctx `
     | Where-Object {
-        $_.Name -like "$($Config.AppConfigName)/$($Config.BackupTimestamp)/*/appconfig.json"
+        $_.Name -like "$($Config.BackupFolderPath)/*/appconfig.json"
     }
 
 if (-not $blobs) {
-    throw "No backup files found for timestamp $($Config.BackupTimestamp)"
+    throw "No backup blobs found at path $($Config.BackupFolderPath)"
 }
 
 #------------------------------------------------------------
-# Restore loop
+# Restore logic
 #------------------------------------------------------------
 foreach ($blob in $blobs) {
 
-    # Extract label from path
     $label = ($blob.Name -split "/")[-2]
 
-    if ($Config.RestoreMode -eq "LabelsOnly" -and
-        $label -notin $Config.LabelsToRestore) {
-        Write-Output "Skipping label [$label]"
+    if ($Config.RestoreMode -eq "SingleLabel" -and
+        $label -ne $Config.LabelToRestore) {
         continue
     }
 
-    Write-Output "Restoring label [$label]"
+    Write-Output "Restoring label [$label] from blob [$($blob.Name)]"
 
-    $localFile = Join-Path $tempDir "restore-$label.json"
+    $tempFile = Join-Path `
+        $env:TEMP `
+        ([System.IO.Path]::GetRandomFileName() + ".json")
 
+    # Download backup
     Get-AzStorageBlobContent `
+        -Context $storageCtx `
         -Container $Config.ContainerName `
         -Blob $blob.Name `
-        -Destination $localFile `
-        -Context $ctx `
+        -Destination $tempFile `
         -Force | Out-Null
 
-    az appconfig kv import `
-        --name $Config.AppConfigName `
-        --source file `
-        --path $localFile `
-        --format json `
-        --auth-mode login `
-        --yes
+    $items = Get-Content $tempFile -Raw | ConvertFrom-Json
 
-    Remove-Item $localFile -Force
+    foreach ($item in $items) {
+
+        $params = @{
+            Endpoint = $endpoint
+            Key      = $item.Key
+            Value    = $item.Value
+        }
+
+        if ($item.Label) {
+            $params.Label = $item.Label
+        }
+
+        if ($item.ContentType) {
+            $params.ContentType = $item.ContentType
+        }
+
+        if ($item.Tags) {
+            $params.Tags = $item.Tags
+        }
+
+        Set-AzAppConfigurationKeyValue @params | Out-Null
+    }
+
+    Remove-Item $tempFile -Force
 }
 
-Write-Output "=== App Configuration Restore Completed Successfully ==="
+#------------------------------------------------------------
+# Completion
+#------------------------------------------------------------
+Write-Output "=============================================="
+Write-Output "App Configuration restoration completed"
+Write-Output "Verify restored keys and labels"
+Write-Output "=============================================="
